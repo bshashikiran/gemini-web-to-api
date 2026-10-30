@@ -31,35 +31,67 @@ import (
 )
 
 type Client struct {
-	httpClient   *req.Client
-	cookies      *CookieStore
-	at           string
-	cookieHeader string // full Cookie header string built by refreshSessionToken, used in GenerateContent
-	pushID       string
-	buildLabel   string
-	sessionID    string
-	language     string
-	mu           sync.RWMutex // protects: at, healthy, cookieHeader, pushID, buildLabel, sessionID, language
-	healthy      bool
-	log          *zap.Logger
+	httpClient             *req.Client
+	cookies                *CookieStore
+	configuredCookieHeader string // optional full browser Cookie header for rollout/session flags
+	authUser               string // Google multi-login slot used by the Gemini Web tab (for example "2")
+	at                     string
+	cookieHeader           string // full Cookie header string built by refreshSessionToken, used in GenerateContent
+	pushID                 string
+	buildLabel             string
+	sessionID              string
+	language               string
+	generationID           string       // client session UUID used in model-selection headers
+	mu                     sync.RWMutex // protects session fields and cachedModels
+	healthy                bool
+	log                    *zap.Logger
 
 	autoRefresh      bool
 	refreshInterval  time.Duration
 	stopRefresh      chan struct{}
 	maxRetries       int
-	cachedModels     []ModelInfo
+	cachedModels     []geminiModel
 	defaultTemporary bool
+
+	// refreshSessionTokenFn is a test seam for Init; nil uses the real
+	// refreshSessionToken implementation.
+	refreshSessionTokenFn func(ctx context.Context) error
+	// rotateFn is a test seam for Init; nil uses the real RotateCookies.
+	rotateFn func() error
+	// sessionValidator is a test seam for UpdateCookies; nil uses the real
+	// Google session check.
+	sessionValidator func(ctx context.Context, cookieHeader string) error
+
+	// sessionMu serializes the operations that replace the Gemini session
+	// (Init, the refresh loop and UpdateCookies), so none of them overwrites
+	// half of another's cookies or session state.
+	sessionMu sync.Mutex
+	// refreshOnce starts the refresh loop once, from Init or from the first
+	// cookie push after a failed Init.
+	refreshOnce sync.Once
+	// envCookieHash fingerprints GEMINI_COOKIES, so a pushed session is only
+	// reused after a restart while GEMINI_COOKIES is unchanged.
+	envCookieHash string
+
+	videoJobsOnce sync.Once
+	videoJobs     *videoJobStore
+	// videoJobTimeout bounds one video job (GEMINI_VIDEO_TIMEOUT_MINUTES);
+	// zero means defaultVideoJobTimeout.
+	videoJobTimeout time.Duration
 }
 
 type CookieStore struct {
 	Secure1PSID   string    `json:"__Secure-1PSID"`
 	Secure1PSIDTS string    `json:"__Secure-1PSIDTS"`
 	UpdatedAt     time.Time `json:"updated_at"`
-	mu            sync.RWMutex
+	// Source records where the in-use cookie set came from ("env", "rotation",
+	// "admin-api"). It carries no secret material and is safe to expose.
+	Source string `json:"source,omitempty"`
+	mu     sync.RWMutex
 }
 
 const (
-	defaultRefreshIntervalMinutes = 30
+	defaultRefreshIntervalMinutes = 1440
 )
 
 var (
@@ -69,16 +101,26 @@ var (
 	buildLabelRegex          = regexp.MustCompile(`"cfb2h":"([^"]+)"`)
 	sessionIDRegex           = regexp.MustCompile(`"FdrFJe":"([^"]+)"`)
 	languageRegex            = regexp.MustCompile(`"TuX5cc":"([^"]+)"`)
-	modelIDRegex             = regexp.MustCompile(`gemini-[a-zA-Z0-9.-]+`)
-	validModelPrefixRegex    = regexp.MustCompile(`^gemini-(\d|advanced)`)
 	imageURLRegex            = regexp.MustCompile(`(?i)(?:https?:)?//[^\s"'<>\\]+|(?:[a-z0-9.-]+\.)?googleusercontent\.com/[^\s"'<>\\]+`)
 )
 
 func NewClient(cfg *configs.Config, log *zap.Logger) *Client {
+	return newClient(cfg, log, nil)
+}
+
+// NewClientWithSessionValidator builds a client whose live session check is
+// replaced by validate. Production wiring uses NewClient; tests use this to
+// exercise cookie updates without reaching Google.
+func NewClientWithSessionValidator(cfg *configs.Config, log *zap.Logger, validate func(ctx context.Context, cookieHeader string) error) *Client {
+	return newClient(cfg, log, validate)
+}
+
+func newClient(cfg *configs.Config, log *zap.Logger, validate func(ctx context.Context, cookieHeader string) error) *Client {
 	cookies := &CookieStore{
 		Secure1PSID:   cfg.Gemini.Secure1PSID,
 		Secure1PSIDTS: cfg.Gemini.Secure1PSIDTS,
 		UpdatedAt:     time.Now(),
+		Source:        CookieSourceEnv,
 	}
 
 	client := req.NewClient().
@@ -91,34 +133,46 @@ func NewClient(cfg *configs.Config, log *zap.Logger) *Client {
 	}
 
 	return &Client{
-		httpClient:       client,
-		cookies:          cookies,
-		autoRefresh:      true,
-		refreshInterval:  time.Duration(refreshIntervalMinutes) * time.Minute,
-		stopRefresh:      make(chan struct{}),
-		maxRetries:       cfg.Gemini.MaxRetries,
-		log:              log,
-		defaultTemporary: cfg.Gemini.Temporary,
+		httpClient:             client,
+		cookies:                cookies,
+		videoJobTimeout:        time.Duration(cfg.Gemini.VideoTimeoutMinutes) * time.Minute,
+		configuredCookieHeader: strings.TrimSpace(cfg.Gemini.Cookies),
+		authUser:               strings.TrimSpace(cfg.Gemini.AuthUser),
+		autoRefresh:            true,
+		refreshInterval:        time.Duration(refreshIntervalMinutes) * time.Minute,
+		stopRefresh:            make(chan struct{}),
+		maxRetries:             cfg.Gemini.MaxRetries,
+		log:                    log,
+		defaultTemporary:       cfg.Gemini.Temporary,
+		sessionValidator:       validate,
+		envCookieHash:          cookieHeaderHash(cfg.Gemini.Cookies),
 	}
 }
 
 func (c *Client) Init(ctx context.Context) error {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+
+	// A session pushed through /admin/cookies replaces GEMINI_COOKIES until
+	// GEMINI_COOKIES itself is edited.
+	if pushed, ok := c.loadPushedSession(); ok {
+		c.usePushedSession(pushed)
+	}
+
 	// Clean cookies
 	c.cookies.Secure1PSID = cleanCookie(c.cookies.Secure1PSID)
 	configPSIDTS := cleanCookie(c.cookies.Secure1PSIDTS) // Save original config value
 	c.cookies.Secure1PSIDTS = configPSIDTS
 
-	// Check if we should use cached cookies or clear cache
-	if c.cookies.Secure1PSID != "" {
-		cachedTS, err := c.LoadCachedCookies()
-
-		// If config has a new PSIDTS that differs from cache, clear cache and use config
-		if configPSIDTS != "" && cachedTS != "" && configPSIDTS != cachedTS {
-			_ = c.ClearCookieCache()
-			// Keep using the config value (already set above)
-		} else if err == nil && cachedTS != "" && configPSIDTS == "" {
-			// Only use cache if config doesn't provide PSIDTS
+	// If the config doesn't provide a PSIDTS, fall back to the cached value
+	// (legacy split-key workflow). When both are present the config value is
+	// tried first; the cache is only consulted again if the config value is
+	// rejected by the server (see below). The cache is never deleted on
+	// mismatch — SaveCachedCookies records whichever source succeeds.
+	if c.cookies.Secure1PSID != "" && c.cookies.Secure1PSIDTS == "" {
+		if cachedTS, err := c.LoadCachedCookies(); err == nil && cachedTS != "" {
 			c.cookies.Secure1PSIDTS = cachedTS
+			configPSIDTS = cachedTS
 			c.log.Info("Loaded __Secure-1PSIDTS from cache")
 		}
 	}
@@ -136,21 +190,36 @@ func (c *Client) Init(ctx context.Context) error {
 	// Populate cookies
 	c.httpClient.SetCommonCookies(c.cookies.ToHTTPCookies()...)
 
-	// Get SNlM0e token
-	err := c.refreshSessionToken()
+	// Get SNlM0e token. Config value first; if the server rejects it and a
+	// different cached TS exists for the same PSID, retry with the cache
+	// before attempting cookie rotation. If everything fails, return the
+	// error from the config attempt — that is the one the user can act on.
+	configErr := c.refreshSessionTokenCompat(ctx)
+	err := configErr
 	if err != nil {
 		c.log.Debug("Initial session token fetch failed, attempting cookie rotation", zap.Error(err))
-		// Try to rotate cookies and retry
-		if rotErr := c.RotateCookies(); rotErr == nil {
-			c.log.Debug("Cookie rotation succeeded, retrying session token fetch")
-			err = c.refreshSessionToken()
-		} else {
-			c.log.Debug("Cookie rotation failed", zap.Error(rotErr))
+		if cachedTS, cerr := c.LoadCachedCookies(); cerr == nil && cachedTS != "" && cachedTS != configPSIDTS {
+			c.log.Info("Config __Secure-1PSIDTS rejected, retrying with cached value")
+			c.cookies.Secure1PSIDTS = cachedTS
+			c.httpClient.SetCommonCookies(c.cookies.ToHTTPCookies()...)
+			err = c.refreshSessionTokenCompat(ctx)
+			if err == nil {
+				c.log.Info("Initialized using cached __Secure-1PSIDTS")
+			}
+		}
+		if err != nil {
+			// Try to rotate cookies and retry
+			if rotErr := c.rotateCompat(); rotErr == nil {
+				c.log.Debug("Cookie rotation succeeded, retrying session token fetch")
+				err = c.refreshSessionTokenCompat(ctx)
+			} else {
+				c.log.Debug("Cookie rotation failed", zap.Error(rotErr))
+			}
 		}
 	}
 
 	if err != nil {
-		return err
+		return configErr
 	}
 
 	// Save the valid cookies to cache immediately after successful init
@@ -159,20 +228,35 @@ func (c *Client) Init(ctx context.Context) error {
 	c.log.Info("✅ Gemini client initialized successfully")
 
 	// 5. Start auto-refresh in background
-	if c.autoRefresh {
-		go c.startAutoRefresh()
-	}
+	c.ensureAutoRefresh()
 
 	return nil
 }
 
-func (c *Client) refreshSessionToken() error {
+// ensureAutoRefresh starts the refresh loop unless it is already running. A
+// failed Init does not start it, so a later cookie push does.
+func (c *Client) ensureAutoRefresh() {
+	if c.autoRefresh {
+		c.refreshOnce.Do(func() { go c.startAutoRefresh() })
+	}
+}
+
+// refreshSessionTokenCompat runs the session-token step, honoring the test
+// seam when set.
+func (c *Client) refreshSessionTokenCompat(ctx context.Context) error {
+	if c.refreshSessionTokenFn != nil {
+		return c.refreshSessionTokenFn(ctx)
+	}
+	return c.refreshSessionToken(ctx)
+}
+
+func (c *Client) refreshSessionToken(ctx context.Context) error {
 	// 1. Initial hit to google.com to get extra cookies (NID, etc)
 	tmpClient := req.NewClient().
 		SetTimeout(30 * time.Second).
 		SetUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-	resp1, err := tmpClient.R().Get("https://www.google.com/")
+	resp1, err := tmpClient.R().SetContext(ctx).Get("https://www.google.com/")
 	extraCookies := ""
 	if err == nil {
 		parts := []string{}
@@ -186,9 +270,18 @@ func (c *Client) refreshSessionToken() error {
 		}
 	}
 
-	// 2. Prepare full cookie string
-	cookieStr := fmt.Sprintf("%s__Secure-1PSID=%s; __Secure-1PSIDTS=%s",
-		extraCookies, c.cookies.Secure1PSID, c.cookies.Secure1PSIDTS)
+	// 2. Prepare the full browser session. GEMINI_COOKIES carries rollout and
+	// account-selection cookies that 1PSID/1PSIDTS alone may not reproduce.
+	// Explicit auth values win if the same names occur in the full header.
+	c.cookies.mu.RLock()
+	psid := c.cookies.Secure1PSID
+	psidts := c.cookies.Secure1PSIDTS
+	c.cookies.mu.RUnlock()
+	c.mu.RLock()
+	configuredCookieHeader := c.configuredCookieHeader // replaced by UpdateCookies
+	c.mu.RUnlock()
+	cookieStr := mergeCookieHeaders(extraCookies, configuredCookieHeader,
+		fmt.Sprintf("__Secure-1PSID=%s; __Secure-1PSIDTS=%s", psid, psidts))
 
 	commonHeaders := map[string]string{
 		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -237,7 +330,7 @@ func (c *Client) refreshSessionToken() error {
 		return strings.Join(res, "; ")
 	}
 
-	req1, _ := http.NewRequest("GET", "https://gemini.google.com/?hl=en", nil)
+	req1, _ := http.NewRequestWithContext(ctx, "GET", "https://gemini.google.com/?hl=en", nil)
 	for k, v := range commonHeaders {
 		req1.Header.Set(k, v)
 	}
@@ -252,14 +345,13 @@ func (c *Client) refreshSessionToken() error {
 	}
 
 	// 2. The main INIT hit
-	req2, _ := http.NewRequest("GET", EndpointInit+"?hl=en", nil)
+	req2, _ := http.NewRequestWithContext(ctx, "GET", geminiAccountURL(EndpointInit, c.authUser)+"?hl=en", nil)
 	for k, v := range commonHeaders {
 		req2.Header.Set(k, v)
 	}
 	req2.Header.Set("Sec-Fetch-Site", "same-origin")
 	req2.Header.Set("Cookie", cookieStr)
 	req2.Header.Set("Referer", "https://gemini.google.com/")
-	req2.Header.Set("Accept-Encoding", "gzip, deflate, br")
 
 	resp, err := hClient.Do(req2)
 	if err != nil {
@@ -292,7 +384,7 @@ func (c *Client) refreshSessionToken() error {
 		if len(matches) < 2 {
 			errMsg := "authentication failed: SNlM0e not found"
 			if strings.Contains(body, "Sign in") || strings.Contains(body, "login") {
-				errMsg = "authentication failed: cookies invalid. Please provide __Secure-1PSIDTS in addition to __Secure-1PSID"
+				errMsg = "authentication failed: GEMINI_COOKIES is invalid or expired; copy the complete Cookie header from Gemini Web"
 			}
 			c.log.Info(errMsg)
 			return fmt.Errorf("%s", errMsg)
@@ -317,54 +409,33 @@ func (c *Client) refreshSessionToken() error {
 	}
 
 	c.mu.Lock()
+	if c.generationID == "" {
+		c.generationID = strings.ToUpper(uuid.NewString())
+	}
+	generationID := c.generationID
+	c.mu.Unlock()
+	models, skipped, err := fetchGeminiModels(ctx, hClient, matches[1], cookieStr, buildLabel, sessionID, language, generationID, c.authUser)
+	if err != nil {
+		return fmt.Errorf("failed to discover Gemini models: %w", err)
+	}
+	for _, entry := range skipped {
+		c.log.Warn("Skipped a Gemini model entry during discovery", zap.String("entry", entry))
+	}
+
+	c.mu.Lock()
 	c.at = matches[1]
 	c.cookieHeader = cookieStr // save full cookie string for use in GenerateContent
 	c.pushID = pushID
 	c.buildLabel = buildLabel
 	c.sessionID = sessionID
 	c.language = language
+	c.cachedModels = models
 	c.healthy = true
 	c.mu.Unlock()
 
-	// Update dynamic models from the same initialization body
-	c.refreshModels(body)
+	c.log.Info("Refreshed available models from Gemini Web", zap.Strings("models", c.ListModelsIDs()))
 
 	return nil
-}
-
-func (c *Client) refreshModels(body string) {
-	var newModels []ModelInfo
-	now := time.Now().Unix()
-
-	matches := modelIDRegex.FindAllString(body, -1)
-
-	uniqueIDs := make(map[string]bool)
-	for _, id := range matches {
-		id = strings.Trim(id, `\"' `)
-		if !uniqueIDs[id] && len(id) > 10 && validModelPrefixRegex.MatchString(id) {
-			uniqueIDs[id] = true
-			newModels = append(newModels, ModelInfo{
-				ID:       id,
-				Created:  now,
-				OwnedBy:  "google",
-				Provider: "gemini",
-			})
-		}
-	}
-
-	c.mu.Lock()
-	c.cachedModels = newModels
-	c.mu.Unlock()
-
-	if len(newModels) == 0 {
-		c.log.Warn("⚠️ No models found in Gemini Web response. Please check your cookies or connection.")
-	} else {
-		ids := make([]string, 0, len(newModels))
-		for _, m := range newModels {
-			ids = append(ids, m.ID)
-		}
-		c.log.Info("🔄 Refreshed available models from Gemini Web", zap.Int("count", len(newModels)), zap.Strings("models", ids))
-	}
 }
 
 // startAutoRefresh periodically refreshes the PSIDTS cookie
@@ -376,54 +447,57 @@ func (c *Client) startAutoRefresh() {
 		select {
 		case <-ticker.C:
 			c.log.Debug("Starting scheduled cookie refresh")
-			rotateErr := c.RotateCookies()
+			// A cookie push must not land between the rotation and the
+			// session refresh, or the refresh would overwrite it.
+			c.sessionMu.Lock()
+			rotateErr, sessionErr, healthy := refreshSessionHealth(
+				c.RotateCookies,
+				func() error { return c.refreshSessionToken(context.Background()) },
+			)
+			c.mu.Lock()
+			c.healthy = healthy
+			c.mu.Unlock()
+			c.sessionMu.Unlock()
+
 			if rotateErr != nil {
-				// Check if it's a 401/403 (cookies fully expired) — no point retrying session token
-				isCookieExpired := strings.Contains(rotateErr.Error(), "status 401") ||
-					strings.Contains(rotateErr.Error(), "status 403")
+				c.log.Warn("Cookie rotation failed; verified the Gemini session separately", zap.Error(rotateErr))
+			}
+			if sessionErr != nil {
+				c.log.Warn("Gemini session token refresh failed", zap.Error(sessionErr))
+			}
 
-				if isCookieExpired {
-					c.log.Error("Cookies have expired — please update GEMINI_1PSID and GEMINI_1PSIDTS in .env",
-						zap.Error(rotateErr),
-						zap.String("action", "Visit https://gemini.google.com → F12 → Application → Cookies"),
-					)
-					c.mu.Lock()
-					c.healthy = false
-					c.mu.Unlock()
-					continue
-				}
-
-				// RotateCookies failed but NOT due to expired cookies (Google may not return new cookie every time)
-				// Fallback: try to refresh the session token (SNlM0e/at) to keep client alive
-				c.log.Warn("Cookie rotation failed, falling back to session token refresh", zap.Error(rotateErr))
-				if sessionErr := c.refreshSessionToken(); sessionErr != nil {
-					// Both methods failed — mark client as unhealthy so callers know
-					c.log.Error("Session token refresh also failed, marking client unhealthy",
-						zap.NamedError("rotation_error", rotateErr),
-						zap.NamedError("session_error", sessionErr),
-					)
-					c.mu.Lock()
-					c.healthy = false
-					c.mu.Unlock()
-				} else {
-					c.log.Info("Session token refreshed successfully after rotation failure")
-					// Ensure client is marked healthy since session token is valid
-					c.mu.Lock()
-					c.healthy = true
-					c.mu.Unlock()
-				}
+			if healthy {
+				c.log.Info("Gemini session refresh completed",
+					zap.Bool("cookie_rotated", rotateErr == nil),
+					zap.Bool("session_token_refreshed", sessionErr == nil),
+				)
 			} else {
-				// Rotation succeeded — also refresh session token to keep SNlM0e/at up to date
-				if sessionErr := c.refreshSessionToken(); sessionErr != nil {
-					c.log.Warn("Cookie rotated but session token refresh failed", zap.Error(sessionErr))
-				} else {
-					c.log.Info("Cookie and session token refreshed successfully")
-				}
+				c.log.Error("Cookie rotation and session verification both failed; marking client unhealthy",
+					zap.NamedError("rotation_error", rotateErr),
+					zap.NamedError("session_error", sessionErr),
+					zap.String("action", "Visit https://gemini.google.com -> F12 -> Network and copy the complete Cookie request header"),
+				)
 			}
 		case <-c.stopRefresh:
 			return
 		}
 	}
+}
+
+func refreshSessionHealth(rotate, refreshToken func() error) (rotateErr, sessionErr error, healthy bool) {
+	rotateErr = rotate()
+	// RotateCookies can reject a session that the Gemini application still accepts.
+	// Always verify against Gemini before deciding that the provider is unhealthy.
+	sessionErr = refreshToken()
+	return rotateErr, sessionErr, rotateErr == nil || sessionErr == nil
+}
+
+// rotateCompat runs cookie rotation, honoring the test seam when set.
+func (c *Client) rotateCompat() error {
+	if c.rotateFn != nil {
+		return c.rotateFn()
+	}
+	return c.RotateCookies()
 }
 
 func (c *Client) RotateCookies() error {
@@ -471,6 +545,7 @@ func (c *Client) RotateCookies() error {
 		if cookie.Name == "__Secure-1PSIDTS" {
 			c.cookies.Secure1PSIDTS = cookie.Value
 			c.cookies.UpdatedAt = time.Now()
+			c.cookies.Source = CookieSourceRotation
 			found = true
 			// Save the new cookie to cache immediately
 			_ = c.SaveCachedCookies()
@@ -496,43 +571,87 @@ func (c *Client) GetCookies() *CookieStore {
 		Secure1PSID:   c.cookies.Secure1PSID,
 		Secure1PSIDTS: c.cookies.Secure1PSIDTS,
 		UpdatedAt:     c.cookies.UpdatedAt,
+		Source:        c.cookies.Source,
 	}
 }
 
 func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...GenerateOption) (*Response, error) {
+	return c.generateContent(ctx, prompt, nil, options...)
+}
+
+// ResolveModel validates a requested public model name and returns the
+// canonical model metadata currently advertised by Gemini Web.
+func (c *Client) ResolveModel(requested string) (ModelInfo, error) {
+	base, canvas := splitCanvasModel(requested)
+	base, music := splitMusicModel(base)
+	c.mu.RLock()
+	model, err := resolveGeminiModel(base, c.cachedModels)
+	c.mu.RUnlock()
+	if err != nil {
+		return ModelInfo{}, err
+	}
+	info := model.ModelInfo
+	if canvas {
+		info.ID += CanvasModelSuffix
+		if info.DisplayName != "" {
+			info.DisplayName += " (Canvas)"
+		}
+	}
+	if music {
+		info.ID += MusicModelSuffix
+		if info.DisplayName != "" {
+			info.DisplayName += " (Music)"
+		}
+	}
+	return info, nil
+}
+
+func (c *Client) generateContent(ctx context.Context, prompt string, metadata []interface{}, options ...GenerateOption) (*Response, error) {
 	config := &GenerateConfig{}
 	for _, opt := range options {
 		opt(config)
 	}
-
-	// Default to first available model if not set or "gemini-pro"
-	c.mu.RLock()
-	if config.Model == "" || config.Model == "gemini-pro" {
-		if len(c.cachedModels) > 0 {
-			config.Model = c.cachedModels[0].ID
+	thinkingLevel, err := ParseThinkingLevel(config.ThinkingLevel)
+	if err != nil {
+		return nil, err
+	}
+	if model, canvas := splitCanvasModel(config.Model); canvas {
+		config.Model = model
+		config.Canvas = true
+	}
+	if model, music := splitMusicModel(config.Model); music {
+		config.Model = model
+		if config.Music == nil {
+			config.Music = &MusicConfig{}
 		}
 	}
 
-	requestedModel := config.Model
-	resolvedModel, found := resolveAvailableModel(requestedModel, c.cachedModels)
-	config.Model = resolvedModel
+	c.mu.Lock()
+	if c.generationID == "" {
+		c.generationID = strings.ToUpper(uuid.NewString())
+	}
+	selectedModel, modelErr := resolveGeminiModel(config.Model, c.cachedModels)
 	at := c.at
 	cookieHdr := c.cookieHeader
 	buildLabel := c.buildLabel
 	sessionID := c.sessionID
 	language := c.language
-	c.mu.RUnlock()
+	generationID := c.generationID
+	c.mu.Unlock()
 	if language == "" {
 		language = "en"
-	}
-
-	if !found && requestedModel != "" {
-		return nil, fmt.Errorf("model '%s' is not supported or not available. Available models: %v", requestedModel, c.ListModelsIDs())
 	}
 
 	if at == "" {
 		return nil, errors.New("client not initialized")
 	}
+	if modelErr != nil {
+		return nil, modelErr
+	}
+	c.log.Debug("Selected Gemini model", zap.String("requested", config.Model),
+		zap.String("model", selectedModel.ID), zap.String("model_id", selectedModel.ModelID),
+		zap.Int("capacity", selectedModel.Capacity), zap.Int("capacity_field", selectedModel.CapacityField),
+		zap.Int("model_number", selectedModel.ModelNumber))
 
 	uploadedFiles, err := c.uploadRequestFiles(ctx, config, cookieHdr)
 	if err != nil {
@@ -540,7 +659,27 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 	}
 
 	requestID := strings.ToUpper(uuid.NewString())
-	inner := buildGenerateInner(prompt, uploadedFiles, config.Model, language, requestID, c.defaultTemporary)
+	inner := buildGenerateInner(prompt, uploadedFiles, selectedModel.ModelNumber, language, requestID, c.defaultTemporary)
+	inner[80] = thinkingLevel
+	if metadata != nil {
+		inner[2] = metadata
+	}
+	modelHeaders, err := buildGeminiModelHeaders(selectedModel, requestID, generationID, thinkingLevel)
+	if err != nil {
+		return nil, err
+	}
+	if config.Video != nil {
+		inner = applyVideoInner(inner, config.Video.AspectRatio)
+	} else if config.Music != nil {
+		inner = applyMusicInner(inner, *config.Music)
+	} else if config.Canvas {
+		inner = applyCanvasInner(inner)
+	}
+	if config.Video != nil || config.Music != nil || config.Canvas {
+		if err := applyWebToolModelHeader(modelHeaders); err != nil {
+			return nil, err
+		}
+	}
 
 	innerJSON, _ := json.Marshal(inner)
 	outer := []interface{}{nil, string(innerJSON)}
@@ -554,21 +693,20 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 
 	queryValues := url.Values{}
 	queryValues.Set("at", at)
-	if len(uploadedFiles) > 0 {
-		queryValues.Set("hl", language)
-		queryValues.Set("_reqid", fmt.Sprintf("%d", rand.Intn(90000)+10000))
-		queryValues.Set("rt", "c")
-		if buildLabel != "" {
-			queryValues.Set("bl", buildLabel)
-		}
-		if sessionID != "" {
-			queryValues.Set("f.sid", sessionID)
-		}
+	queryValues.Set("hl", language)
+	queryValues.Set("_reqid", fmt.Sprintf("%d", rand.Intn(90000)+10000))
+	queryValues.Set("rt", "c")
+	if buildLabel != "" {
+		queryValues.Set("bl", buildLabel)
 	}
-	generateURL := EndpointGenerate + "?" + queryValues.Encode()
+	if sessionID != "" {
+		queryValues.Set("f.sid", sessionID)
+	}
+	generateURL := geminiAccountURL(EndpointGenerate, c.authUser) + "?" + queryValues.Encode()
 
 	maxAttempts := c.maxRetries
-	if maxAttempts <= 0 {
+	// A retried video/music request could start (and bill) a second generation.
+	if maxAttempts <= 0 || config.Video != nil || config.Music != nil {
 		maxAttempts = 1
 	}
 
@@ -606,19 +744,9 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 		httpReq.Header.Set("Referer", "https://gemini.google.com/")
 		httpReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 		httpReq.Header.Set("X-Same-Domain", "1")
-		if len(uploadedFiles) > 0 {
-			httpReq.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`["%s",1]`, requestID))
+		for name, value := range modelHeaders {
+			httpReq.Header.Set(name, value)
 		}
-		modeFlag := 0
-		if c.defaultTemporary {
-			modeFlag = 1
-		}
-		traceID := strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
-		extHeader := fmt.Sprintf(
-			`[1,null,null,null,"%s",null,null,%d,[4,5,6,8],null,null,2,null,null,6,1,"%s"]`,
-			traceID, modeFlag, strings.ToUpper(uuid.NewString()),
-		)
-		httpReq.Header.Set("x-goog-ext-525001261-jspb", extHeader)
 		if cookieHdr != "" {
 			httpReq.Header.Set("Cookie", cookieHdr)
 		}
@@ -634,10 +762,9 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 			lastErr = err
 			continue
 		}
-		defer httpResp.Body.Close()
-
 		if httpResp.StatusCode != http.StatusOK {
 			bodySnippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, 512))
+			_ = httpResp.Body.Close()
 			lastErr = fmt.Errorf("generate failed with status: %d", httpResp.StatusCode)
 			c.log.Warn("Generate returned non-200",
 				zap.Int("status", httpResp.StatusCode),
@@ -651,6 +778,7 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 		}
 
 		respBytes, err := io.ReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
 		if err != nil {
 			lastErr = fmt.Errorf("failed to read generate response: %w", err)
 			continue
@@ -669,7 +797,27 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 			)
 			continue
 		}
-
+		result.Model = selectedModel.ID
+		result.ModelID = selectedModel.ModelID
+		result.RequestedModel = strings.TrimSpace(config.Model)
+		if result.RequestedModel == "" {
+			result.RequestedModel = selectedModel.ID
+		}
+		// Gemini may silently serve a lower-tier model when the selected model's
+		// web quota is exhausted. A single known model ID in the protocol body is
+		// routing evidence; never label that response as the requested model.
+		if actual, ok := c.responseModel(respBody); ok && actual.ModelID != selectedModel.ModelID {
+			result.Model = actual.ID
+			result.ModelID = actual.ModelID
+			c.log.Warn("Gemini served a different model",
+				zap.String("requested_model", selectedModel.ID),
+				zap.String("actual_model", actual.ID),
+			)
+		}
+		if config.Canvas {
+			result.Model += CanvasModelSuffix
+			result.RequestedModel += CanvasModelSuffix
+		}
 		c.log.Debug("GenerateContent timing",
 			zap.Duration("gemini_server_rtt", httpDuration),
 			zap.Duration("parse_duration", parseDuration),
@@ -702,6 +850,27 @@ func (c *Client) GenerateContent(ctx context.Context, prompt string, options ...
 		zap.Error(lastErr),
 	)
 	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func (c *Client) responseModel(responseBody string) (geminiModel, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var found *geminiModel
+	for i := range c.cachedModels {
+		model := &c.cachedModels[i]
+		if model.ModelID == "" || !strings.Contains(responseBody, model.ModelID) {
+			continue
+		}
+		if found != nil {
+			return geminiModel{}, false
+		}
+		copy := *model
+		found = &copy
+	}
+	if found == nil {
+		return geminiModel{}, false
+	}
+	return *found, true
 }
 
 const maxGeneratedImageBytes = 50 << 20
@@ -759,33 +928,55 @@ func (c *Client) downloadGeneratedImage(ctx context.Context, rawURL, cookieHeade
 	return base64.StdEncoding.EncodeToString(body), nil
 }
 
-func resolveAvailableModel(requested string, models []ModelInfo) (string, bool) {
-	requested = strings.TrimSpace(requested)
-	if requested == "" {
-		return "", false
+// ParseThinkingLevel maps effort names to the Gemini Web header and body enum.
+func ParseThinkingLevel(level string) (int, error) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "", "low":
+		return 1, nil
+	case "medium":
+		return 4, nil
+	case "high":
+		return 2, nil
+	default:
+		return 0, fmt.Errorf("unsupported thinking level %q: use low, medium, or high", level)
 	}
-
-	for _, model := range models {
-		if model.ID == requested {
-			return model.ID, true
-		}
-	}
-
-	var matches []string
-	prefix := requested + "-"
-	for _, model := range models {
-		if strings.HasPrefix(model.ID, prefix) {
-			matches = append(matches, model.ID)
-		}
-	}
-	if len(matches) == 1 {
-		return matches[0], true
-	}
-
-	return requested, false
 }
 
-func buildGenerateInner(prompt string, files []uploadedFile, model, language, requestID string, isTemporary bool) []interface{} {
+// buildGeminiModelHeaders uses the routing identity discovered for this account.
+// The ID at index 4 is a model ID, not a randomly generated request/trace ID.
+func buildGeminiModelHeaders(model geminiModel, requestID, generationID string, thinkingLevel int) (map[string]string, error) {
+	if model.ModelID == "" || model.ModelNumber <= 0 || model.Capacity <= 0 ||
+		(model.CapacityField != 12 && model.CapacityField != 13) {
+		return nil, fmt.Errorf("model '%s' has incomplete Gemini routing information", model.ID)
+	}
+	offset := model.CapacityField - 12
+	header := make([]interface{}, 17+offset)
+	header[0] = 1
+	header[4] = model.ModelID
+	header[7] = 0
+	header[8] = []int{4, 5, 6, 8}
+	// CapacityField is a one-based protocol field number.
+	header[model.CapacityField-1] = model.Capacity
+	header[14+offset] = model.ModelNumber
+	header[15+offset] = thinkingLevel
+	header[16+offset] = generationID
+	encoded, err := json.Marshal(header)
+	if err != nil {
+		return nil, err
+	}
+	requestHeader, err := json.Marshal([]interface{}{requestID, 1})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{
+		geminiModelHeaderKey:        string(encoded),
+		"x-goog-ext-525005358-jspb": string(requestHeader),
+		"x-goog-ext-73010989-jspb":  "[0]",
+		"x-goog-ext-73010990-jspb":  "[0,0,0]",
+	}, nil
+}
+
+func buildGenerateInner(prompt string, files []uploadedFile, modelNumber int, language, requestID string, isTemporary bool) []interface{} {
 	var messageContent []interface{}
 	if len(files) == 0 {
 		messageContent = []interface{}{prompt}
@@ -798,11 +989,10 @@ func buildGenerateInner(prompt string, files []uploadedFile, model, language, re
 	}
 
 	defaultMetadata := []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
-	inner := make([]interface{}, 69)
+	inner := make([]interface{}, 81)
 	inner[0] = messageContent
 	inner[1] = []interface{}{language}
 	inner[2] = defaultMetadata
-	inner[3] = model
 	inner[6] = []interface{}{1}
 	inner[7] = 1
 	inner[10] = 1
@@ -815,11 +1005,12 @@ func buildGenerateInner(prompt string, files []uploadedFile, model, language, re
 	inner[53] = 0
 	inner[59] = requestID
 	inner[61] = []interface{}{}
-	inner[68] = 2
+	inner[68] = 1
+	inner[79] = modelNumber
+	inner[80] = 1
 
 	if isTemporary {
 		inner[45] = 1
-		inner[67] = 0
 	}
 
 	return inner
@@ -831,13 +1022,19 @@ func (c *Client) StartChat(options ...ChatOption) ChatSession {
 		opt(config)
 	}
 
-	c.mu.RLock()
-	if config.Model == "" || config.Model == "gemini-pro" {
-		if len(c.cachedModels) > 0 {
-			config.Model = c.cachedModels[0].ID
+	// Pin the default chat mode so a registry refresh cannot change it between
+	// turns. An explicit Pro request must always go through Pro resolution.
+	if config.Model == "" {
+		if config.Metadata != nil && config.Metadata.Model != "" {
+			config.Model = config.Metadata.Model
+		} else {
+			c.mu.RLock()
+			if len(c.cachedModels) > 0 {
+				config.Model = c.cachedModels[0].ID
+			}
+			c.mu.RUnlock()
 		}
 	}
-	c.mu.RUnlock()
 
 	return &GeminiChatSession{
 		client:   c,
@@ -848,6 +1045,7 @@ func (c *Client) StartChat(options ...ChatOption) ChatSession {
 }
 
 func (c *Client) Close() error {
+	c.videoJobStore().close()
 	close(c.stopRefresh)
 	c.mu.Lock()
 	c.healthy = false
@@ -873,7 +1071,11 @@ func (c *Client) ListModels() []ModelInfo {
 		return []ModelInfo{}
 	}
 
-	return c.cachedModels
+	models := make([]ModelInfo, 0, len(c.cachedModels))
+	for _, model := range c.cachedModels {
+		models = append(models, model.ModelInfo)
+	}
+	return models
 }
 
 func (c *Client) ListModelsIDs() []string {
@@ -891,8 +1093,16 @@ func (c *Client) ListModelsIDs() []string {
 func (c *Client) parseResponse(text string) (*Response, error) {
 	var finalResText string
 	var finalMetadata map[string]any
+	var finalUsage map[string]any
 	found := false
 	imagesByURL := make(map[string]Image)
+	var videos []Video
+	seenVideos := make(map[string]bool)
+	var canvases []Canvas
+	var audios []Audio
+	seenAudio := make(map[string]bool)
+	conversationID := ""
+	var labels reasoningLabels
 
 	lines := strings.Split(text, "\n")
 	for _, line := range lines {
@@ -929,6 +1139,37 @@ func (c *Client) parseResponse(text string) (*Response, error) {
 					continue
 				}
 				collectImages(payload, imagesByURL)
+				// Thinking models stream their thought summary as a status
+				// label on small wrb.fr frames before the answer arrives.
+				if label := extractReasoningLabel(payload); label != "" {
+					labels.add(label)
+				}
+				if um := findUsageMetadata(payload); um != nil {
+					// Later frames win: streamed responses repeat metadata,
+					// and the final frame carries the authoritative counts.
+					finalUsage = um
+				}
+				if id := conversationIDFromPayload(payload); id != "" {
+					conversationID = id
+				}
+				// Newer StreamGenerate replies (notably the Videos tool
+				// acknowledgement) stream a turn as numbered-field updates,
+				// e.g. [null,["c_...","r_..."],{"7":["text"],"44":true}],
+				// instead of the classic candidates array at index 4. Shorter
+				// frames, with no field map at index 2, carry neither.
+				if len(payload) > 2 && len(payload) < 5 {
+					if fields, ok := payload[2].(map[string]interface{}); ok {
+						if parts, ok := fields["7"].([]interface{}); ok && len(parts) > 0 {
+							if reply, ok := parts[0].(string); ok && reply != "" {
+								finalResText = reply
+								found = true
+								if finalMetadata == nil {
+									finalMetadata = map[string]any{"cid": conversationID}
+								}
+							}
+						}
+					}
+				}
 				if len(payload) > 4 {
 					candidates, ok := payload[4].([]interface{})
 					if ok && candidates != nil && len(candidates) > 0 {
@@ -940,8 +1181,24 @@ func (c *Client) parseResponse(text string) (*Response, error) {
 							for _, image := range extractGeneratedImages(candidate) {
 								imagesByURL[image.URL] = image
 							}
+							for _, audio := range extractGeneratedAudio(candidate) {
+								if !seenAudio[audio.URL] {
+									seenAudio[audio.URL] = true
+									audios = append(audios, audio)
+								}
+							}
+							for _, video := range extractGeneratedVideos(candidate) {
+								if !seenVideos[video.URL] {
+									seenVideos[video.URL] = true
+									videos = append(videos, video)
+								}
+							}
 						}
 						firstCandidate, ok := candidates[0].([]interface{})
+						// Canvas content is streamed in some frames only; keep the latest.
+						if found := extractCanvases(firstCandidate); len(found) > 0 {
+							canvases = found
+						}
 						if ok && len(firstCandidate) >= 2 {
 							contentParts, ok := firstCandidate[1].([]interface{})
 							if ok && len(contentParts) > 0 {
@@ -976,17 +1233,47 @@ func (c *Client) parseResponse(text string) (*Response, error) {
 		}
 	}
 
-	if found || len(imagesByURL) > 0 {
+	if found || len(imagesByURL) > 0 || len(videos) > 0 || len(audios) > 0 {
 		images := make([]Image, 0, len(imagesByURL))
 		for _, image := range imagesByURL {
 			images = append(images, image)
 		}
-		reasoning, cleanText := utils.ExtractThinkingAndText(finalResText)
+		// Gemini's web UI leaks citation markers and code-event fence suffixes into
+		// the response body. Strip them here, at the single text path shared by the
+		// OpenAI, Claude and Gemini-native endpoints, and from canvas documents, so
+		// a canvas reads the same inline and as a file. The reply is stripped before
+		// canvases are rendered into it, so code canvases stay verbatim in both.
+		for i := range canvases {
+			if canvases[i].Type == CanvasDocument {
+				canvases[i].Content = utils.StripCitationArtifacts(canvases[i].Content)
+			}
+		}
+		finalResText = renderCanvasPlaceholders(utils.StripCitationArtifacts(finalResText), canvases)
+		markerReasoning, cleanText := utils.ExtractThinkingAndText(finalResText)
+		// Label frames are the modern shape; the <ctrl94>/<ctrl95> block is
+		// kept as a fallback for captures that still inline the old trace.
+		reasoning := labels.text()
+		if reasoning == "" {
+			reasoning = markerReasoning
+		}
+		var usage *UsageMetadata
+		if finalUsage != nil {
+			usage = &UsageMetadata{
+				PromptTokens:     usageCount(finalUsage, "promptTokenCount"),
+				CompletionTokens: usageCount(finalUsage, "candidatesTokenCount"),
+				TotalTokens:      usageCount(finalUsage, "totalTokenCount"),
+			}
+		}
 		return &Response{
-			Text:          cleanText,
-			ReasoningText: reasoning,
-			Images:        images,
-			Metadata:      finalMetadata,
+			Text:           cleanText,
+			ReasoningText:  reasoning,
+			Images:         images,
+			Videos:         videos,
+			Canvases:       canvases,
+			Audios:         audios,
+			Metadata:       finalMetadata,
+			Usage:          usage,
+			ConversationID: conversationID,
 		}, nil
 	}
 
@@ -995,6 +1282,99 @@ func (c *Client) parseResponse(text string) (*Response, error) {
 		sample = sample[:500]
 	}
 	return nil, fmt.Errorf("failed to parse response. Sample: %s", sample)
+}
+
+// reasoningLabels accumulates Gemini's thinking status labels in stream order.
+// Gemini streams these on small wrb.fr frames while it thinks, repeating the
+// same label across several frames, so neighbouring duplicates are collapsed.
+//
+// This is Google's thought *summary* -- the same lines the Gemini web UI shows
+// in its Thinking block -- not a verbatim chain of thought. The wire format
+// carries no verbatim trace.
+type reasoningLabels struct {
+	labels []string
+}
+
+// add records one label, ignoring blanks and consecutive repeats.
+func (r *reasoningLabels) add(label string) {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return
+	}
+	if n := len(r.labels); n > 0 && r.labels[n-1] == label {
+		return
+	}
+	r.labels = append(r.labels, label)
+}
+
+// text joins the collected labels newline-separated, as ReasoningText expects.
+func (r *reasoningLabels) text() string {
+	return strings.Join(r.labels, "\n")
+}
+
+// extractReasoningLabel reads the thinking status label carried by a decoded
+// StreamGenerate payload. During the thinking phase Gemini sends
+// payload[2] = {"7": [null, null, null, null, null, ["<label>"]], "44": true}
+// -- the label lives at payload[2]["7"][5][0], and the reply text at [0] is
+// still empty. Frames without that shape, including field-7 frames that
+// already carry reply text, return "".
+func extractReasoningLabel(payload []interface{}) string {
+	if len(payload) < 3 {
+		return ""
+	}
+	fields, ok := payload[2].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	parts, ok := fields["7"].([]interface{})
+	if !ok || len(parts) < 6 {
+		return ""
+	}
+	if reply, _ := parts[0].(string); reply != "" {
+		return ""
+	}
+	labels, ok := parts[5].([]interface{})
+	if !ok || len(labels) == 0 {
+		return ""
+	}
+	label, _ := labels[0].(string)
+	return strings.TrimSpace(label)
+}
+
+// findUsageMetadata recursively searches a decoded payload for a
+// usageMetadata object, as carried by Gemini responses.
+func findUsageMetadata(v any) map[string]any {
+	switch val := v.(type) {
+	case map[string]any:
+		if um, ok := val["usageMetadata"].(map[string]any); ok {
+			return um
+		}
+		for _, child := range val {
+			if um := findUsageMetadata(child); um != nil {
+				return um
+			}
+		}
+	case []any:
+		for _, child := range val {
+			if um := findUsageMetadata(child); um != nil {
+				return um
+			}
+		}
+	}
+	return nil
+}
+
+// usageCount extracts an integer count from a decoded JSON object.
+func usageCount(m map[string]any, key string) int64 {
+	switch v := m[key].(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	}
+	return 0
 }
 
 // extractBardError recursively searches for BardErrorInfo and extracts codes/messages
@@ -1264,6 +1644,29 @@ func cleanCookie(v string) string {
 	return v
 }
 
+func mergeCookieHeaders(headers ...string) string {
+	values := make(map[string]string)
+	order := make([]string, 0)
+	for _, header := range headers {
+		for _, pair := range strings.Split(header, ";") {
+			name, value, ok := strings.Cut(strings.TrimSpace(pair), "=")
+			name = strings.TrimSpace(name)
+			if !ok || name == "" {
+				continue
+			}
+			if _, exists := values[name]; !exists {
+				order = append(order, name)
+			}
+			values[name] = strings.TrimSpace(value)
+		}
+	}
+	parts := make([]string, 0, len(order))
+	for _, name := range order {
+		parts = append(parts, name+"="+values[name])
+	}
+	return strings.Join(parts, "; ")
+}
+
 // LoadCachedCookies attempts to read the saved 1PSIDTS from disk
 func (c *Client) LoadCachedCookies() (string, error) {
 	if c.cookies.Secure1PSID == "" {
@@ -1340,4 +1743,18 @@ var DefaultHeaders = map[string]string{
 	"Referer":       "https://gemini.google.com/",
 	"User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 	"X-Same-Domain": "1",
+}
+
+func geminiAccountURL(endpoint, authUser string) string {
+	if authUser == "" {
+		return endpoint
+	}
+	return strings.Replace(endpoint, "https://gemini.google.com/", "https://gemini.google.com/u/"+authUser+"/", 1)
+}
+
+func geminiSourcePath(authUser string) string {
+	if authUser == "" {
+		return "/app"
+	}
+	return "/u/" + authUser + "/app"
 }

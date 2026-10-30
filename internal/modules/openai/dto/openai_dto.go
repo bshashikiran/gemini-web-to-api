@@ -29,8 +29,10 @@ type ChatCompletionMessage struct {
 
 func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 	type rawMessage struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Role       string            `json:"role"`
+		Content    json.RawMessage   `json:"content"`
+		ToolCalls  []json.RawMessage `json:"tool_calls,omitempty"`
+		ToolCallID string            `json:"tool_call_id,omitempty"`
 	}
 
 	var raw rawMessage
@@ -41,6 +43,47 @@ func (m *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
 	m.Role = raw.Role
 	m.Content = ""
 	m.Attachments = nil
+
+	// Check if this is an OpenAI tool result message (role = tool)
+	if raw.ToolCallID != "" {
+		var contentStr string
+		if len(raw.Content) > 0 && string(raw.Content) != "null" {
+			if err := json.Unmarshal(raw.Content, &contentStr); err == nil {
+				m.Content = fmt.Sprintf("[Tool Result for ID %s]: %s", raw.ToolCallID, contentStr)
+			} else {
+				m.Content = fmt.Sprintf("[Tool Result for ID %s]: %s", raw.ToolCallID, string(raw.Content))
+			}
+		} else {
+			m.Content = fmt.Sprintf("[Tool Result for ID %s]: ", raw.ToolCallID)
+		}
+		return nil
+	}
+
+	// Check if this is an OpenAI assistant message containing tool calls
+	if len(raw.ToolCalls) > 0 {
+		var textParts []string
+		var contentStr string
+		if len(raw.Content) > 0 && string(raw.Content) != "null" {
+			if err := json.Unmarshal(raw.Content, &contentStr); err == nil && contentStr != "" {
+				textParts = append(textParts, contentStr)
+			}
+		}
+		for _, tcRaw := range raw.ToolCalls {
+			var tc struct {
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			}
+			if err := json.Unmarshal(tcRaw, &tc); err == nil {
+				textParts = append(textParts, fmt.Sprintf("[Call Tool: %s with ID %s and Input: %s]", tc.Function.Name, tc.ID, tc.Function.Arguments))
+			}
+		}
+		m.Content = strings.Join(textParts, "\n")
+		return nil
+	}
 
 	if len(raw.Content) == 0 || string(raw.Content) == "null" {
 		return nil
@@ -107,25 +150,10 @@ func attachmentFromDataURL(value string, index int) (models.Attachment, bool) {
 		mimeType = "application/octet-stream"
 	}
 	return models.Attachment{
-		Name:     fmt.Sprintf("image_%d%s", index, extensionFromMimeType(mimeType)),
+		Name:     fmt.Sprintf("image_%d%s", index, models.ExtensionForMimeType(mimeType)),
 		MimeType: mimeType,
 		Data:     metaAndData[1],
 	}, true
-}
-
-func extensionFromMimeType(mimeType string) string {
-	switch strings.ToLower(strings.TrimSpace(mimeType)) {
-	case "image/jpeg", "image/jpg":
-		return ".jpg"
-	case "image/png":
-		return ".png"
-	case "image/webp":
-		return ".webp"
-	case "image/gif":
-		return ".gif"
-	default:
-		return ".bin"
-	}
 }
 
 // ToolFunctionDefinition represents OpenAI tool function schema
@@ -152,15 +180,66 @@ type ToolChoiceObject struct {
 	Function ToolChoiceFunction `json:"function,omitempty"`
 }
 
+// ResponseFormat mirrors OpenAI's response_format object. Type "text" (or a
+// missing response_format) is a no-op; "json_object" and "json_schema" ask for
+// a JSON reply, which this bridge asks for in the prompt and validates
+// afterwards, best-effort.
+type ResponseFormat struct {
+	Type       string          `json:"type"`
+	JSONSchema json.RawMessage `json:"json_schema,omitempty" swagignore:"true"` // @SchemaType object
+}
+
+// SchemaDocument returns the JSON Schema carried by json_schema. OpenAI nests it
+// under "schema"; a block that already is the schema is read as-is.
+func (f ResponseFormat) SchemaDocument() json.RawMessage {
+	if len(f.JSONSchema) == 0 || string(f.JSONSchema) == "null" {
+		return nil
+	}
+	var wrapper struct {
+		Schema json.RawMessage `json:"schema"`
+	}
+	if err := json.Unmarshal(f.JSONSchema, &wrapper); err == nil && len(wrapper.Schema) > 0 && string(wrapper.Schema) != "null" {
+		return wrapper.Schema
+	}
+	return f.JSONSchema
+}
+
 // ChatCompletionRequest represents OpenAI chat completion request
 type ChatCompletionRequest struct {
-	Model         string                  `json:"model"`
-	Messages      []ChatCompletionMessage `json:"messages"`
-	Tools         []ToolDefinition        `json:"tools,omitempty"`
-	ToolChoiceRaw json.RawMessage         `json:"tool_choice,omitempty" swagignore:"true"` // @SchemaType object
-	Stream        bool                    `json:"stream,omitempty"`
-	Temperature   float32                 `json:"temperature,omitempty"`
-	MaxTokens     int                     `json:"max_tokens,omitempty"`
+	Model           string                  `json:"model"`
+	Messages        []ChatCompletionMessage `json:"messages"`
+	Tools           []ToolDefinition        `json:"tools,omitempty"`
+	ToolChoiceRaw   json.RawMessage         `json:"tool_choice,omitempty" swagignore:"true"` // @SchemaType object
+	Stream          bool                    `json:"stream,omitempty"`
+	StreamOptions   *StreamOptions          `json:"stream_options,omitempty"`
+	Temperature     float32                 `json:"temperature,omitempty"`
+	MaxTokens       int                     `json:"max_tokens,omitempty"`
+	ReasoningEffort string                  `json:"reasoning_effort,omitempty"`
+	ResponseFormat  *ResponseFormat         `json:"response_format,omitempty"`
+}
+
+// JSONResponseRequested reports whether the client asked for a JSON reply and
+// returns the requested JSON Schema (nil for json_object). Only the types
+// "json_object" and "json_schema" switch JSON mode on: "text", unknown types
+// and a missing field stay no-ops so clients that send them keep working.
+func (r ChatCompletionRequest) JSONResponseRequested() (json.RawMessage, bool) {
+	if r.ResponseFormat == nil {
+		return nil, false
+	}
+	switch strings.ToLower(strings.TrimSpace(r.ResponseFormat.Type)) {
+	case "json_object":
+		return nil, true
+	case "json_schema":
+		return r.ResponseFormat.SchemaDocument(), true
+	default:
+		return nil, false
+	}
+}
+
+// StreamOptions represents OpenAI stream_options
+type StreamOptions struct {
+	// IncludeUsage adds a final chunk carrying the usage for the request.
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 func (r ChatCompletionRequest) ToModelMessages() []models.Message {
@@ -239,16 +318,19 @@ type ChatCompletionResponseMessage struct {
 	Content          string                   `json:"content,omitempty"`
 	ReasoningContent string                   `json:"reasoning_content,omitempty"`
 	ToolCalls        []ChatCompletionToolCall `json:"tool_calls,omitempty"`
+	// Canvases lists files written by Gemini's Canvas tool ("-canvas" models).
+	Canvases []models.CanvasFile `json:"canvases,omitempty"`
 }
 
 // ChatCompletionResponse represents OpenAI chat completion response
 type ChatCompletionResponse struct {
-	ID      string       `json:"id"`
-	Object  string       `json:"object"`
-	Created int64        `json:"created"`
-	Model   string       `json:"model"`
-	Choices []Choice     `json:"choices"`
-	Usage   models.Usage `json:"usage"`
+	ID             string       `json:"id"`
+	Object         string       `json:"object"`
+	Created        int64        `json:"created"`
+	Model          string       `json:"model"`
+	RequestedModel string       `json:"requested_model,omitempty"`
+	Choices        []Choice     `json:"choices"`
+	Usage          models.Usage `json:"usage"`
 }
 
 // Choice represents a response choice
@@ -278,6 +360,7 @@ type ChatCompletionChunkDelta struct {
 	Content          string                             `json:"content,omitempty"`
 	ReasoningContent string                             `json:"reasoning_content,omitempty"`
 	ToolCalls        []ChatCompletionChunkDeltaToolCall `json:"tool_calls,omitempty"`
+	Canvases         []models.CanvasFile                `json:"canvases,omitempty"`
 }
 
 // ChatCompletionChunk represents a streaming chunk
@@ -287,6 +370,8 @@ type ChatCompletionChunk struct {
 	Created int64         `json:"created"`
 	Model   string        `json:"model"`
 	Choices []ChunkChoice `json:"choices"`
+	// Usage is set only on the final chunk sent for stream_options.include_usage.
+	Usage *models.Usage `json:"usage,omitempty"`
 }
 
 // ChunkChoice represents a choice in a chunk
@@ -316,4 +401,89 @@ type ImageGenerationData struct {
 	URL           string `json:"url,omitempty"`
 	B64JSON       string `json:"b64_json,omitempty"`
 	RevisedPrompt string `json:"revised_prompt,omitempty"`
+}
+
+// VideoGenerationRequest starts an asynchronous text-to-video job. It is
+// accepted as JSON or as multipart/form-data (what the OpenAI SDK sends).
+// Size accepts "1280x720" (default) or "720x1280"; AspectRatio accepts
+// "16:9" or "9:16". Seconds is accepted for SDK compatibility and ignored:
+// Gemini Web decides the clip length.
+type VideoGenerationRequest struct {
+	Model       string `json:"model,omitempty" form:"model"`
+	Prompt      string `json:"prompt" form:"prompt"`
+	Size        string `json:"size,omitempty" form:"size"`
+	Seconds     string `json:"seconds,omitempty" form:"seconds"`
+	AspectRatio string `json:"aspect_ratio,omitempty" form:"aspect_ratio"`
+}
+
+// Video mirrors the OpenAI Videos API object, plus Gemini-specific fields.
+type Video struct {
+	ID             string         `json:"id"`
+	Object         string         `json:"object"`
+	Model          string         `json:"model"`
+	Status         string         `json:"status"`
+	Progress       int            `json:"progress"`
+	CreatedAt      int64          `json:"created_at"`
+	CompletedAt    *int64         `json:"completed_at"`
+	ExpiresAt      *int64         `json:"expires_at"`
+	Prompt         string         `json:"prompt"`
+	Seconds        string         `json:"seconds"`
+	Size           string         `json:"size"`
+	Error          *VideoJobError `json:"error"`
+	ConversationID string         `json:"conversation_id,omitempty"`
+	ContentURL     string         `json:"content_url,omitempty"`
+	Message        string         `json:"message,omitempty"`
+}
+
+// VideoJobError explains why a video job failed.
+type VideoJobError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// VideoList is the response of GET /videos.
+type VideoList struct {
+	Object  string  `json:"object"`
+	Data    []Video `json:"data"`
+	FirstID *string `json:"first_id"`
+	LastID  *string `json:"last_id"`
+	HasMore bool    `json:"has_more"`
+}
+
+// VideoDeleted is the response of DELETE /videos/{id}.
+type VideoDeleted struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Deleted bool   `json:"deleted"`
+}
+
+// SpeechRequest is the OpenAI audio/speech body. Gemini Web has no
+// text-to-speech, so the bridge generates music from Input instead:
+// Voice "instrumental" or "vocals" selects the vocal mode (any other voice
+// leaves it to the prompt), Instructions are appended as style guidance,
+// and Length and Genre (bridge extensions, sent with extra_body) pick the
+// web client's options.
+type SpeechRequest struct {
+	Model          string          `json:"model"`
+	Input          string          `json:"input"`
+	Voice          json.RawMessage `json:"voice,omitempty"`
+	Instructions   string          `json:"instructions,omitempty"`
+	ResponseFormat string          `json:"response_format,omitempty"`
+	Speed          float64         `json:"speed,omitempty"`
+	StreamFormat   string          `json:"stream_format,omitempty"`
+	Length         string          `json:"length,omitempty"`
+	Genre          string          `json:"genre,omitempty"`
+}
+
+// VoiceName returns the voice as a string; custom voices are {"id": "..."}.
+func (r SpeechRequest) VoiceName() string {
+	var name string
+	if json.Unmarshal(r.Voice, &name) == nil {
+		return name
+	}
+	var custom struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(r.Voice, &custom)
+	return custom.ID
 }

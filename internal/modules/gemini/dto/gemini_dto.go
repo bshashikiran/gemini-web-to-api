@@ -1,6 +1,9 @@
 package dto
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // GeminiModelsResponse represents the response from /v1beta/models
 type GeminiModelsResponse struct {
@@ -18,11 +21,82 @@ type GeminiModel struct {
 
 // GeminiGenerateRequest represents a Gemini generate request
 type GeminiGenerateRequest struct {
-	Contents         []Content           `json:"contents"`
-	Tools            []Tool              `json:"tools,omitempty"`
-	ToolConfig       *ToolConfig         `json:"tool_config,omitempty"`
-	GenerationConfig *GenerationConfig   `json:"generationConfig,omitempty"`
-	Safety           []map[string]string `json:"safety_settings,omitempty"`
+	Contents          []Content           `json:"contents"`
+	SystemInstruction *Content            `json:"system_instruction,omitempty"`
+	Tools             []Tool              `json:"tools,omitempty"`
+	ToolConfig        *ToolConfig         `json:"tool_config,omitempty"`
+	GenerationConfig  *GenerationConfig   `json:"generationConfig,omitempty"`
+	Safety            []map[string]string `json:"safety_settings,omitempty"`
+}
+
+func (r *GeminiGenerateRequest) UnmarshalJSON(data []byte) error {
+	type alias GeminiGenerateRequest
+	var raw struct {
+		alias
+		SystemInstructionCamel *Content    `json:"systemInstruction"`
+		ToolConfigCamel        *ToolConfig `json:"toolConfig"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = GeminiGenerateRequest(raw.alias)
+	if r.SystemInstruction == nil && raw.SystemInstructionCamel != nil {
+		r.SystemInstruction = raw.SystemInstructionCamel
+	}
+	if r.ToolConfig == nil && raw.ToolConfigCamel != nil {
+		r.ToolConfig = raw.ToolConfigCamel
+	}
+	return nil
+}
+
+// FunctionCallingMode returns tool_config's mode upper-cased: "AUTO", "ANY",
+// "NONE", or "" when it is not set.
+func (r GeminiGenerateRequest) FunctionCallingMode() string {
+	if r.ToolConfig == nil || r.ToolConfig.FunctionCallingConfig == nil {
+		return ""
+	}
+	return strings.ToUpper(strings.TrimSpace(r.ToolConfig.FunctionCallingConfig.Mode))
+}
+
+// HasToolsEnabled reports whether the model may call functions: some are
+// declared and tool_config mode is not NONE.
+func (r GeminiGenerateRequest) HasToolsEnabled() bool {
+	if r.FunctionCallingMode() == "NONE" {
+		return false
+	}
+	for _, tool := range r.Tools {
+		if len(tool.FunctionDeclarations) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// DeclaresFunction reports whether name is one of the declared functions.
+func (r GeminiGenerateRequest) DeclaresFunction(name string) bool {
+	for _, tool := range r.Tools {
+		for _, fn := range tool.FunctionDeclarations {
+			if fn.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// AllowsFunction reports whether tool_config's allowed_function_names permits
+// name; an empty list allows every declared function.
+func (r GeminiGenerateRequest) AllowsFunction(name string) bool {
+	if r.ToolConfig == nil || r.ToolConfig.FunctionCallingConfig == nil ||
+		len(r.ToolConfig.FunctionCallingConfig.AllowedFunctionNames) == 0 {
+		return true
+	}
+	for _, allowed := range r.ToolConfig.FunctionCallingConfig.AllowedFunctionNames {
+		if allowed == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Content represents a content block in Gemini API
@@ -31,14 +105,15 @@ type Content struct {
 	Parts []Part `json:"parts"`
 }
 
-// Part represents a part of content
+// Part represents a part of content. It is written in the REST (camelCase)
+// spellings official SDKs parse; UnmarshalJSON also accepts snake_case.
 type Part struct {
 	Text             string            `json:"text,omitempty"`
 	Thought          bool              `json:"thought,omitempty"`
-	InlineData       *InlineData       `json:"inline_data,omitempty"`
-	FileData         *FileData         `json:"file_data,omitempty"`
-	FunctionCall     *FunctionCall     `json:"function_call,omitempty"`
-	FunctionResponse *FunctionResponse `json:"function_response,omitempty"`
+	InlineData       *InlineData       `json:"inlineData,omitempty"`
+	FileData         *FileData         `json:"fileData,omitempty"`
+	FunctionCall     *FunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *FunctionResponse `json:"functionResponse,omitempty"`
 }
 
 func (p *Part) UnmarshalJSON(data []byte) error {
@@ -95,6 +170,22 @@ type Tool struct {
 	FunctionDeclarations []FunctionDeclaration `json:"function_declarations,omitempty"`
 }
 
+// UnmarshalJSON reads the declarations in either spelling, since REST clients send camelCase
+func (t *Tool) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Snake []FunctionDeclaration `json:"function_declarations"`
+		Camel []FunctionDeclaration `json:"functionDeclarations"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	t.FunctionDeclarations = raw.Snake
+	if len(t.FunctionDeclarations) == 0 {
+		t.FunctionDeclarations = raw.Camel
+	}
+	return nil
+}
+
 // FunctionDeclaration represents a function schema
 type FunctionDeclaration struct {
 	Name        string          `json:"name"`
@@ -102,9 +193,49 @@ type FunctionDeclaration struct {
 	Parameters  json.RawMessage `json:"parameters,omitempty" swagignore:"true"` // @SchemaType object
 }
 
+// UnmarshalJSON falls back to parametersJsonSchema when parameters is absent
+func (d *FunctionDeclaration) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Name                string          `json:"name"`
+		Description         string          `json:"description"`
+		Parameters          json.RawMessage `json:"parameters"`
+		ParametersJSONCamel json.RawMessage `json:"parametersJsonSchema"`
+		ParametersJSONSnake json.RawMessage `json:"parameters_json_schema"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	d.Name = raw.Name
+	d.Description = raw.Description
+	d.Parameters = raw.Parameters
+	if len(d.Parameters) == 0 {
+		d.Parameters = raw.ParametersJSONCamel
+	}
+	if len(d.Parameters) == 0 {
+		d.Parameters = raw.ParametersJSONSnake
+	}
+	return nil
+}
+
 // ToolConfig represents configuration for tool use
 type ToolConfig struct {
 	FunctionCallingConfig *FunctionCallingConfig `json:"function_calling_config,omitempty"`
+}
+
+// UnmarshalJSON reads the calling config in either spelling
+func (c *ToolConfig) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Snake *FunctionCallingConfig `json:"function_calling_config"`
+		Camel *FunctionCallingConfig `json:"functionCallingConfig"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	c.FunctionCallingConfig = raw.Snake
+	if c.FunctionCallingConfig == nil {
+		c.FunctionCallingConfig = raw.Camel
+	}
+	return nil
 }
 
 // FunctionCallingConfig represents configuration for function calling
@@ -113,10 +244,29 @@ type FunctionCallingConfig struct {
 	AllowedFunctionNames []string `json:"allowed_function_names,omitempty"`
 }
 
+// UnmarshalJSON reads the allowed names in either spelling
+func (c *FunctionCallingConfig) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Mode         string   `json:"mode"`
+		AllowedSnake []string `json:"allowed_function_names"`
+		AllowedCamel []string `json:"allowedFunctionNames"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	c.Mode = raw.Mode
+	c.AllowedFunctionNames = raw.AllowedSnake
+	if len(c.AllowedFunctionNames) == 0 {
+		c.AllowedFunctionNames = raw.AllowedCamel
+	}
+	return nil
+}
+
 // InlineData represents inline data (e.g., images)
 type InlineData struct {
-	MimeType string `json:"mimeType"`
-	Data     string `json:"data"`
+	MimeType    string `json:"mimeType"`
+	Data        string `json:"data"`
+	DisplayName string `json:"displayName,omitempty"`
 }
 
 // FileData represents file data referenced by URI.
@@ -130,6 +280,8 @@ func (d *InlineData) UnmarshalJSON(data []byte) error {
 		MimeTypeCamel string `json:"mimeType"`
 		MimeTypeSnake string `json:"mime_type"`
 		Data          string `json:"data"`
+		DisplayCamel  string `json:"displayName"`
+		DisplaySnake  string `json:"display_name"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -139,6 +291,10 @@ func (d *InlineData) UnmarshalJSON(data []byte) error {
 		d.MimeType = raw.MimeTypeSnake
 	}
 	d.Data = raw.Data
+	d.DisplayName = raw.DisplayCamel
+	if d.DisplayName == "" {
+		d.DisplayName = raw.DisplaySnake
+	}
 	return nil
 }
 
@@ -176,4 +332,67 @@ type UsageMetadata struct {
 	PromptTokenCount     int32 `json:"promptTokenCount"`
 	CandidatesTokenCount int32 `json:"candidatesTokenCount"`
 	TotalTokenCount      int32 `json:"totalTokenCount"`
+}
+
+// PredictLongRunningRequest is the body of models/{model}:predictLongRunning,
+// which google-genai sends for client.models.generate_videos.
+type PredictLongRunningRequest struct {
+	Instances  []VideoInstance  `json:"instances"`
+	Parameters *VideoParameters `json:"parameters,omitempty"`
+}
+
+// VideoInstance is one video request; only the text prompt is supported.
+type VideoInstance struct {
+	Prompt string          `json:"prompt"`
+	Image  json.RawMessage `json:"image,omitempty"`
+	Video  json.RawMessage `json:"video,omitempty"`
+}
+
+// VideoParameters holds generation options. Only aspectRatio and sampleCount
+// are honored; Gemini Web decides duration and resolution.
+type VideoParameters struct {
+	AspectRatio      string `json:"aspectRatio,omitempty"`
+	SampleCount      int    `json:"sampleCount,omitempty"`
+	DurationSeconds  int    `json:"durationSeconds,omitempty"`
+	NegativePrompt   string `json:"negativePrompt,omitempty"`
+	PersonGeneration string `json:"personGeneration,omitempty"`
+	Resolution       string `json:"resolution,omitempty"`
+}
+
+// VideoOperation is a google.longrunning.Operation for a video job.
+type VideoOperation struct {
+	Name     string                  `json:"name"`
+	Done     bool                    `json:"done"`
+	Metadata map[string]any          `json:"metadata,omitempty"`
+	Response *VideoOperationResponse `json:"response,omitempty"`
+	Error    *OperationError         `json:"error,omitempty"`
+}
+
+// VideoOperationResponse wraps the generated videos of a finished operation.
+type VideoOperationResponse struct {
+	Type                  string                `json:"@type"`
+	GenerateVideoResponse GenerateVideoResponse `json:"generateVideoResponse"`
+}
+
+// GenerateVideoResponse lists the generated samples.
+type GenerateVideoResponse struct {
+	GeneratedSamples []GeneratedSample `json:"generatedSamples"`
+}
+
+// GeneratedSample is one generated video.
+type GeneratedSample struct {
+	Video GeneratedVideoFile `json:"video"`
+}
+
+// GeneratedVideoFile points at the downloadable MP4.
+type GeneratedVideoFile struct {
+	URI      string `json:"uri"`
+	Encoding string `json:"encoding,omitempty"`
+}
+
+// OperationError is a google.rpc.Status.
+type OperationError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Status  string `json:"status,omitempty"`
 }

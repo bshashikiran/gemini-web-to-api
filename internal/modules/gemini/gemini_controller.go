@@ -5,40 +5,61 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"regexp"
 	"sync"
 	"time"
 
 	common "gemini-web-to-api/internal/commons/utils"
 	"gemini-web-to-api/internal/modules/gemini/dto"
+	"gemini-web-to-api/internal/modules/providers"
 
 	"github.com/gofiber/fiber/v3"
 	"go.uber.org/zap"
 )
 
 type GeminiController struct {
-	service *GeminiService
-	log     *zap.Logger
-	mu      sync.RWMutex
-	store   *taskStore
+	service  *GeminiService
+	log      *zap.Logger
+	mu       sync.RWMutex
+	store    *taskStore
+	stopChan chan struct{}
 }
 
-func NewGeminiController(service *GeminiService) *GeminiController {
+func NewGeminiController(service *GeminiService, log *zap.Logger) *GeminiController {
 	store := newTaskStore()
+	stopChan := make(chan struct{})
 
 	// Start background job to purge old tasks periodically
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
-		for range ticker.C {
-			store.purgeOlderThan(24 * time.Hour)
+		for {
+			select {
+			case <-ticker.C:
+				store.purgeOlderThan(24 * time.Hour)
+			case <-stopChan:
+				return
+			}
 		}
 	}()
 
 	return &GeminiController{
-		service: service,
-		log:     zap.NewNop(),
-		store:   store,
+		service:  service,
+		log:      log,
+		store:    store,
+		stopChan: stopChan,
+	}
+}
+
+// Close terminates background tasks
+func (h *GeminiController) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.stopChan != nil {
+		close(h.stopChan)
+		h.stopChan = nil
 	}
 }
 
@@ -76,11 +97,27 @@ func (h *GeminiController) HandleV1BetaModels(c fiber.Ctx) error {
 	for _, m := range availableModels {
 		geminiModels = append(geminiModels, dto.GeminiModel{
 			Name:                       "models/" + m.ID,
-			DisplayName:                m.ID,
+			DisplayName:                m.DisplayName,
 			SupportedGenerationMethods: []string{"generateContent", "streamGenerateContent"},
 		})
 	}
 	return c.JSON(dto.GeminiModelsResponse{Models: geminiModels})
+}
+
+// HandleV1BetaModel returns one dynamically discovered Gemini model.
+func (h *GeminiController) HandleV1BetaModel(c fiber.Ctx) error {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	model, err := h.service.ResolveModel(c.Params("model"))
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(common.ErrorToResponse(err, "invalid_request_error"))
+	}
+	return c.JSON(dto.GeminiModel{
+		Name:                       "models/" + model.ID,
+		DisplayName:                model.DisplayName,
+		SupportedGenerationMethods: []string{"generateContent", "streamGenerateContent"},
+	})
 }
 
 // HandleV1BetaGenerateContent handles the official Gemini generateContent endpoint
@@ -101,6 +138,9 @@ func (h *GeminiController) HandleV1BetaGenerateContent(c fiber.Ctx) error {
 	var req dto.GeminiGenerateRequest
 	if err := c.Bind().Body(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(common.ErrorToResponse(fmt.Errorf("invalid request body: %w", err), "invalid_request_error"))
+	}
+	if _, err := h.service.ResolveModel(model); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(common.ErrorToResponse(err, "invalid_request_error"))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -137,20 +177,35 @@ func (h *GeminiController) HandleV1BetaStreamGenerateContent(c fiber.Ctx) error 
 	if err := c.Bind().Body(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(common.ErrorToResponse(fmt.Errorf("invalid request body: %w", err), "invalid_request_error"))
 	}
+	if _, err := h.service.ResolveModel(model); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(common.ErrorToResponse(err, "invalid_request_error"))
+	}
 
-	c.Set("Content-Type", "application/json")
-	c.Set("Transfer-Encoding", "chunked")
+	useSSE := c.Query("alt") == "sse"
+	if useSSE {
+		c.Set("Content-Type", "text/event-stream")
+		c.Set("Cache-Control", "no-cache")
+	} else {
+		c.Set("Content-Type", "application/x-ndjson")
+	}
 
 	c.RequestCtx().SetBodyStreamWriter(func(w *bufio.Writer) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
 		err := h.service.GenerateContentStream(ctx, model, req, func(resp dto.GeminiGenerateResponse) bool {
+			if useSSE {
+				return common.SendSSEEvent(w, h.log, resp)
+			}
 			return common.SendStreamChunk(w, h.log, resp) == nil
 		})
 		if err != nil {
 			h.log.Error("GenerateContentStream failed", zap.Error(err), zap.String("model", model))
-			_ = common.SendStreamChunk(w, h.log, common.ErrorToResponse(err, "api_error"))
+			if useSSE {
+				_ = common.SendSSEEvent(w, h.log, common.ErrorToResponse(err, "api_error"))
+			} else {
+				_ = common.SendStreamChunk(w, h.log, common.ErrorToResponse(err, "api_error"))
+			}
 		}
 	})
 
@@ -309,9 +364,101 @@ func (h *GeminiController) HandleInteractionGet(c fiber.Ctx) error {
 	return c.JSON(taskToDTO(task))
 }
 
+// videoFileIDPattern finds the job ID in a files/{id}:download path. The last
+// match is used because google-genai, given a non-https video URI, appends the
+// whole URI to the path ("files/http://host/.../files/{id}:download…").
+var videoFileIDPattern = regexp.MustCompile(`files/([a-z0-9]+):download`)
+
+func videoRequestError(c fiber.Ctx, err error) error {
+	var validationErr *providers.VideoValidationError
+	var modelErr *providers.ModelSelectionError
+	switch {
+	case errors.As(err, &validationErr), errors.As(err, &modelErr):
+		return c.Status(fiber.StatusBadRequest).JSON(common.ErrorToResponse(err, "invalid_request_error"))
+	case errors.Is(err, providers.ErrVideoBusy):
+		return c.Status(fiber.StatusTooManyRequests).JSON(common.ErrorToResponse(err, "rate_limit_error"))
+	case errors.Is(err, providers.ErrVideoJobNotFound):
+		return c.Status(fiber.StatusNotFound).JSON(common.ErrorToResponse(err, "not_found"))
+	case errors.Is(err, providers.ErrVideoNotReady):
+		return c.Status(fiber.StatusConflict).JSON(common.ErrorToResponse(err, "invalid_request_error"))
+	}
+	return c.Status(fiber.StatusInternalServerError).JSON(common.ErrorToResponse(err, "internal_error"))
+}
+
+// HandlePredictLongRunning starts a text-to-video job (client.models.generate_videos)
+// @Summary Generate videos (Gemini)
+// @Description Starts an asynchronous text-to-video job using Gemini Web's Videos tool and returns a long-running operation. Poll the operation, then download the video file.
+// @Tags Gemini
+// @Accept json
+// @Produce json
+// @Param model path string true "Model ID (veo-* names use the account default)"
+// @Param request body dto.PredictLongRunningRequest true "Video request"
+// @Success 200 {object} dto.VideoOperation
+// @Failure 400 {object} map[string]interface{}
+// @Failure 429 {object} map[string]interface{}
+// @Router /gemini/v1beta/models/{model}:predictLongRunning [post]
+func (h *GeminiController) HandlePredictLongRunning(c fiber.Ctx) error {
+	var req dto.PredictLongRunningRequest
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(common.ErrorToResponse(fmt.Errorf("invalid request body: %w", err), "invalid_request_error"))
+	}
+	operation, err := h.service.StartVideoOperation(c.Params("model"), req)
+	if err != nil {
+		h.log.Warn("Start video operation failed", zap.Error(err))
+		return videoRequestError(c, err)
+	}
+	return c.JSON(operation)
+}
+
+// HandleGetOperation polls a video operation (client.operations.get)
+// @Summary Get video operation
+// @Tags Gemini
+// @Produce json
+// @Param model path string true "Model ID"
+// @Param operation path string true "Operation ID"
+// @Success 200 {object} dto.VideoOperation
+// @Failure 404 {object} map[string]interface{}
+// @Router /gemini/v1beta/models/{model}/operations/{operation} [get]
+func (h *GeminiController) HandleGetOperation(c fiber.Ctx) error {
+	fileBaseURL := c.BaseURL() + "/gemini/v1beta/files"
+	operation, err := h.service.GetVideoOperation(c.Params("model"), c.Params("operation"), fileBaseURL)
+	if err != nil {
+		return videoRequestError(c, err)
+	}
+	return c.JSON(operation)
+}
+
+// HandleDownloadFile serves a generated video (client.files.download)
+// @Summary Download generated video
+// @Tags Gemini
+// @Produce video/mp4
+// @Param file path string true "File ID"
+// @Success 200 {file} binary
+// @Failure 404 {object} map[string]interface{}
+// @Failure 409 {object} map[string]interface{}
+// @Router /gemini/v1beta/files/{file}:download [get]
+func (h *GeminiController) HandleDownloadFile(c fiber.Ctx) error {
+	matches := videoFileIDPattern.FindAllStringSubmatch(c.Path(), -1)
+	if len(matches) == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(common.ErrorToResponse(fmt.Errorf("file not found"), "not_found"))
+	}
+	id := matches[len(matches)-1][1]
+	data, mimeType, err := h.service.VideoFile(id)
+	if err != nil {
+		return videoRequestError(c, err)
+	}
+	c.Set(fiber.HeaderContentType, mimeType)
+	c.Set(fiber.HeaderContentDisposition, `attachment; filename="`+id+`.mp4"`)
+	return c.Send(data)
+}
+
 // Register registers the Gemini routes on the provided router
 func (g *GeminiController) Register(group fiber.Router) {
+	group.Post("/models/:model\\:predictLongRunning", g.HandlePredictLongRunning)
+	group.Get("/models/:model/operations/:operation", g.HandleGetOperation)
+	group.Get("/files/*", g.HandleDownloadFile)
 	group.Get("/models", g.HandleV1BetaModels)
+	group.Get("/models/:model", g.HandleV1BetaModel)
 	group.Post("/models/:model\\:generateContent", g.HandleV1BetaGenerateContent)
 	group.Post("/models/:model\\:streamGenerateContent", g.HandleV1BetaStreamGenerateContent)
 	group.Post("/deepresearch", g.HandleDeepResearch)

@@ -3,6 +3,7 @@ package models
 import (
 	"encoding/json"
 	"fmt"
+	"mime"
 	"strings"
 )
 
@@ -116,7 +117,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 			if part.Source == nil || strings.ToLower(part.Source.Type) != "base64" || part.Source.Data == "" {
 				continue
 			}
-			name := fmt.Sprintf("image_%d%s", i+1, extensionFromMimeType(part.Source.MediaType))
+			name := fmt.Sprintf("image_%d%s", i+1, ExtensionForMimeType(part.Source.MediaType))
 			m.Attachments = append(m.Attachments, Attachment{
 				Name:     name,
 				MimeType: part.Source.MediaType,
@@ -156,19 +157,51 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func extensionFromMimeType(mimeType string) string {
-	switch strings.ToLower(strings.TrimSpace(mimeType)) {
-	case "image/jpeg", "image/jpg":
-		return ".jpg"
-	case "image/png":
-		return ".png"
-	case "image/webp":
-		return ".webp"
-	case "image/gif":
-		return ".gif"
-	default:
-		return ".bin"
+// attachmentExtensions maps attachment MIME types to the file extension an
+// upload needs for Gemini Web to treat it as that kind of file.
+var attachmentExtensions = map[string]string{
+	"image/jpeg":         ".jpg",
+	"image/jpg":          ".jpg",
+	"image/png":          ".png",
+	"image/webp":         ".webp",
+	"image/gif":          ".gif",
+	"application/pdf":    ".pdf",
+	"application/msword": ".doc",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+	"application/vnd.ms-excel": ".xls",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         ".xlsx",
+	"application/vnd.ms-powerpoint":                                             ".ppt",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+	"text/plain":       ".txt",
+	"text/markdown":    ".md",
+	"text/csv":         ".csv",
+	"application/json": ".json",
+	"application/rtf":  ".rtf",
+}
+
+// ExtensionForMimeType returns the file extension for an attachment's MIME
+// type, ignoring parameters such as charset, or ".bin" when it is unknown.
+func ExtensionForMimeType(mimeType string) string {
+	mediaType, _, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		mediaType = strings.ToLower(strings.TrimSpace(mimeType))
 	}
+	if ext, ok := attachmentExtensions[mediaType]; ok {
+		return ext
+	}
+	return ".bin"
+}
+
+// CanvasFile is a code file or document Gemini wrote with its Canvas tool.
+// Content is the raw file content (code is not wrapped in a Markdown fence).
+type CanvasFile struct {
+	ID       string `json:"id"`
+	Title    string `json:"title,omitempty"`
+	FileName string `json:"file_name"`
+	Type     string `json:"type"` // "code" or "document"
+	Language string `json:"language,omitempty"`
+	MimeType string `json:"mime_type"`
+	Content  string `json:"content"`
 }
 
 // ModelListResponse represents the list of models
@@ -199,13 +232,11 @@ type Delta struct {
 	Role        string `json:"role,omitempty"`
 }
 
-// Usage represents token usage (compatible format)
+// Usage represents OpenAI token usage
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
-	InputTokens      int `json:"input_tokens,omitempty"`
-	OutputTokens     int `json:"output_tokens,omitempty"`
 }
 
 // ErrorResponse represents a standard error response

@@ -41,13 +41,28 @@ type ChatSession interface {
 	Clear()
 }
 
+// UsageMetadata carries token counts reported by the upstream response, when
+// the wire format includes them.
+type UsageMetadata struct {
+	PromptTokens     int64 `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64 `json:"completion_tokens,omitempty"`
+	TotalTokens      int64 `json:"total_tokens,omitempty"`
+}
+
 // Response represents a provider's response
 type Response struct {
+	Model          string         `json:"model,omitempty"`
+	ModelID        string         `json:"model_id,omitempty"`
+	RequestedModel string         `json:"requested_model,omitempty"`
 	Text           string         `json:"text"`
 	ReasoningText  string         `json:"reasoning_text,omitempty"`
 	Images         []Image        `json:"images,omitempty"`
+	Videos         []Video        `json:"videos,omitempty"`
+	Canvases       []Canvas       `json:"canvases,omitempty"`
+	Audios         []Audio        `json:"audios,omitempty"`
 	Candidates     []Candidate    `json:"candidates,omitempty"`
 	Metadata       map[string]any `json:"metadata,omitempty"`
+	Usage          *UsageMetadata `json:"usage,omitempty"`
 	ChosenIndex    int            `json:"chosen_index"`
 	ConversationID string         `json:"conversation_id,omitempty"`
 	ResponseID     string         `json:"response_id,omitempty"`
@@ -93,11 +108,15 @@ type GenerateOption func(*GenerateConfig)
 // GenerateConfig holds generation configuration
 type GenerateConfig struct {
 	Model                   string
+	ThinkingLevel           string
 	Files                   []string
 	InputFiles              []InputFile
 	Temperature             float64
 	MaxTokens               int
 	DownloadGeneratedImages bool
+	Video                   *VideoConfig
+	Canvas                  bool
+	Music                   *MusicConfig
 }
 
 // InputFile is an in-memory file to upload with a generation request.
@@ -120,6 +139,13 @@ type ChatConfig struct {
 func WithModel(model string) GenerateOption {
 	return func(c *GenerateConfig) {
 		c.Model = model
+	}
+}
+
+// WithThinkingLevel selects the Gemini Web thinking level for one request.
+func WithThinkingLevel(level string) GenerateOption {
+	return func(c *GenerateConfig) {
+		c.ThinkingLevel = level
 	}
 }
 

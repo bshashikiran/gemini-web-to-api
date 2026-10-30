@@ -17,10 +17,10 @@ type ClaudeController struct {
 	log     *zap.Logger
 }
 
-func NewClaudeController(service *ClaudeService) *ClaudeController {
+func NewClaudeController(service *ClaudeService, log *zap.Logger) *ClaudeController {
 	return &ClaudeController{
 		service: service,
-		log:     zap.NewNop(),
+		log:     log,
 	}
 }
 
@@ -45,7 +45,7 @@ func (h *ClaudeController) HandleModels(c fiber.Ctx) error {
 			"id":           m.ID,
 			"type":         "model",
 			"created_at":   m.Created,
-			"display_name": m.ID,
+			"display_name": m.DisplayName,
 		})
 	}
 	return c.JSON(fiber.Map{
@@ -64,11 +64,17 @@ func (h *ClaudeController) HandleModels(c fiber.Ctx) error {
 // @Router /claude/v1/models/{model_id} [get]
 func (h *ClaudeController) HandleModelByID(c fiber.Ctx) error {
 	modelID := c.Params("model_id")
+	model, err := h.service.ResolveModel(modelID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"type": "error", "error": fiber.Map{"type": "not_found_error", "message": err.Error()},
+		})
+	}
 	return c.JSON(fiber.Map{
-		"id":           modelID,
+		"id":           model.ID,
 		"type":         "model",
-		"created_at":   time.Now().Unix(),
-		"display_name": modelID,
+		"created_at":   model.Created,
+		"display_name": model.DisplayName,
 	})
 }
 
@@ -93,6 +99,11 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 			"error": fiber.Map{"type": "invalid_request_error", "message": "Invalid JSON body"},
 		})
 	}
+	if err := h.service.ValidateMessage(req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"type": "error", "error": fiber.Map{"type": "invalid_request_error", "message": err.Error()},
+		})
+	}
 
 	if req.Stream {
 		c.Set("Content-Type", "text/event-stream")
@@ -105,7 +116,7 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 			defer cancel()
 
 			err := h.service.GenerateMessageStream(ctx, req, func(ev dto.StreamEvent) bool {
-				return common.SendSSEEvent(w, h.log, ev)
+				return common.SendSSEChunk(w, h.log, ev.Type, ev) == nil
 			})
 			if err != nil {
 				h.log.Error("GenerateMessageStream failed", zap.Error(err), zap.String("model", req.Model))
@@ -116,7 +127,7 @@ func (h *ClaudeController) HandleMessages(c fiber.Ctx) error {
 						Message: err.Error(),
 					},
 				}
-				_ = common.SendSSEEvent(w, h.log, errEv)
+				_ = common.SendSSEChunk(w, h.log, "error", errEv)
 			}
 		})
 
@@ -157,14 +168,8 @@ func (h *ClaudeController) HandleCountTokens(c fiber.Ctx) error {
 		})
 	}
 
-	// Simple estimation
-	totalChars := len(req.System.Text)
-	for _, m := range req.Messages {
-		totalChars += len(m.Content)
-	}
-
 	return c.JSON(fiber.Map{
-		"input_tokens": totalChars / 4,
+		"input_tokens": h.service.CountTokens(req),
 	})
 }
 
